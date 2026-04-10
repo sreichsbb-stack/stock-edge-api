@@ -1,75 +1,61 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-import yfinance as yf
+import requests
+import json
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-import os, json, time
-import redis
+import os
+from typing import Optional
 
-app = FastAPI(title="Stock Edge API")
+app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 analyzer = SentimentIntensityAnalyzer()
-r = None
-try:
-    r = redis.from_url(os.getenv("REDIS_URL"))
-except:
-    pass
+
+# FREE Alpha Vantage (sign up: alphavantage.co - 25 calls/min)
+AV_KEY = os.getenv("AV_KEY", "demo")  # Add later
 
 @app.get("/")
 def root():
-    return {"status": "LIVE", "endpoints": ["/stock-edge/AAPL", "/stock-edge/BTC-USD"]}
+    return {"status": "LIVE", "demo": "/stock-edge/AAPL"}
 
 @app.get("/stock-edge/{symbol}")
 async def edge(symbol: str):
     symbol = symbol.upper()
-    cache_key = f"edge:{symbol}"
     
-    if r:
-        cached = r.get(cache_key)
-        if cached:
-            return json.loads(cached)
-    
-    symbols_to_try = [symbol, symbol.replace("=", "-"), f"{symbol}=X"]
-    
-    for sym in symbols_to_try:
-        try:
-            ticker = yf.Ticker(sym)
-            hist = ticker.history(period="5d", timeout=10)
+    try:
+        # Alpha Vantage (more reliable)
+        if AV_KEY != "demo":
+            url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={symbol}&apikey={AV_KEY}"
+            resp = requests.get(url, timeout=5).json()
+            price = float(resp['Global Quote']['05. price'])
+        else:
+            # Yahoo fallback with headers
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            ticker = yf.Ticker(symbol, session=requests.Session())
+            hist = ticker.history(period="2d", headers=headers)
             
-            if len(hist) > 0:
-                info = ticker.info
-                news = ticker.news[:3]
-                
-                sentiment = 0
-                if news:
-                    sentiment = sum(analyzer.polarity_scores(n.get('title', ''))['compound'] for n in news) / len(news)
-                
-                latest = hist.iloc[-1]
-                change = 0
-                if len(hist) > 1:
-                    change = ((latest['Close'] - hist['Close'].iloc[-2]) / hist['Close'].iloc[-2]) * 100
-                
-                result = {
-                    "symbol": symbol,
-                    "company": info.get('longName', symbol),
-                    "price": round(float(latest['Close']), 2),
-                    "change_pct": round(change, 2),
-                    "sentiment": round(sentiment * 100, 1),
-                    "volume": int(latest['Volume']),
-                    "volume_spike": latest['Volume'] > hist['Volume'].mean(),
-                    "recommendation": "BUY" if sentiment > 0.1 else ("SELL" if sentiment < -0.1 else "HOLD")
-                }
-                
-                if r:
-                    r.setex(cache_key, 600, json.dumps(result))
-                
-                return result
-                
-        except:
-            continue
-    
-    return {"error": "No data found", "tried": symbols_to_try, "status": "Try SPY or QQQ"}
+            if hist.empty:
+                return {"error": "No data", "symbol": symbol}
+            
+            price = float(hist['Close'].iloc[-1])
+        
+        # News sentiment (FinancialModelingPrep free)
+        news_url = f"https://financialmodelingprep.com/api/v3/stock_news?tickers={symbol}&limit=3&apikey=demo"
+        news = requests.get(news_url).json()
+        sentiment = sum(analyzer.polarity_scores(n['title'])['compound'] for n in news[:3]) / 3
+        
+        return {
+            "symbol": symbol,
+            "price": round(price, 2),
+            "sentiment": round(sentiment * 100, 1),
+            "recommendation": "BUY" if sentiment > 0.1 else "SELL"
+        }
+        
+    except Exception as e:
+        return {"error": str(e), "status": "service ready"}
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0
