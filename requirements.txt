@@ -1,6 +1,5 @@
---pre
 fastapi==0.104.1
-uvicorn[standard]==0.24.0
+uvicorn==0.24.0
 yfinance==0.2.31
 vaderSentiment==3.3.2
 redis==5.0.1
