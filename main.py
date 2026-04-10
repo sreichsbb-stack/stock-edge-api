@@ -31,27 +31,29 @@ async def edge(symbol: str, api_key: Optional[str] = "demo_key"):
     
     try:
         ticker = yf.Ticker(symbol)
-        hist = ticker.history(period="2d")
-        news = ticker.news[:5]
-        
-        sentiment = sum([analyzer.polarity_scores(n['title'])['compound'] for n in news]) / 5
+        hist = ticker.history(period="5d")  # 5d = more reliable
+        if hist.empty:
+            raise HTTPException(404, "No data")
+            
+        news = ticker.news[:3] or [{"title": "Neutral"}]  # Fallback
+        sentiment = sum([analyzer.polarity_scores(n['title'])['compound'] for n in news]) / len(news)
         latest = hist.iloc[-1]
         change = ((latest['Close'] - hist['Close'].iloc[-2]) / hist['Close'].iloc[-2]) * 100
         
         result = {
             "symbol": symbol,
-            "price": round(latest['Close'], 2),
+            "price": float(latest['Close']),
             "change": round(change, 2),
             "sentiment": round(sentiment * 100, 1),
             "volume_spike": latest['Volume'] > hist['Volume'].mean(),
-            "rec": "BUY" if sentiment > 0.1 else "SELL"
+            "rec": "BUY" if sentiment > 0.05 else "SELL"
         }
         
-        if r: r.setex(f"edge:{symbol}", 300, json.dumps(result))
+        if r: r.setex(f"edge:{symbol}", 600, json.dumps(result))
         return result
         
     except Exception as e:
-        raise HTTPException(500, f"Error: {str(e)}")
+        return {"error": str(e), "symbol": symbol, "tip": "Try TSLA or BTC-USD"}
 
 if __name__ == "__main__":
     import uvicorn
