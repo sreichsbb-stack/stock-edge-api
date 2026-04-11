@@ -153,11 +153,20 @@ def get_trend(symbol):
 # -----------------------------
 @app.get("/stock-edge/{symbol}")
 async def edge(symbol: str):
+    import time
+
     symbol = symbol.upper()
 
+    # 🔥 Try Alpha Vantage
     price = get_price_av(symbol)
     source = "alpha_vantage"
 
+    # 🔁 Retry once (handles AV hiccups)
+    if price is None:
+        time.sleep(1)
+        price = get_price_av(symbol)
+
+    # 🔁 Fallback to Yahoo
     if price is None:
         price = get_price_yf(symbol)
         source = "yfinance"
@@ -180,45 +189,73 @@ async def edge(symbol: str):
 # SIGNAL ENDPOINT (💰 MONEY MAKER)
 # -----------------------------
 @app.get("/signal/{symbol}")
-async def signal(symbol: str):
+async def signal(symbol: str, api_key: str = None):
+    import time
+
+    # 🔐 API KEY CHECK
+    if not api_key or not validate_api_key(api_key):
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    # 🚫 RATE LIMIT
+    if not check_rate_limit(api_key):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+
     symbol = symbol.upper()
 
+    # 🔥 USE UNIQUE CACHE KEY
+    cache_key = f"signal:{symbol}"
+
     # 🔥 CACHE FIRST
-    cached = get_cached(symbol)
+    cached = get_cached(cache_key)
     if cached:
         return {**cached, "cached": True}
 
-    # 🔥 PRICE
+    # 🔥 PRICE (WITH RETRY)
     price = get_price_av(symbol)
     source = "alpha_vantage"
 
     if price is None:
+        print("Retrying Alpha Vantage...")
+        time.sleep(1)
+        price = get_price_av(symbol)
+
+    # 🔁 FALLBACK
+    if price is None:
+        print("Falling back to Yahoo...")
         price = get_price_yf(symbol)
         source = "yfinance"
 
+    # ❌ STILL NO DATA
     if price is None:
-        return {"error": "No data", "symbol": symbol}
+        return {
+            "error": "No data",
+            "symbol": symbol,
+            "debug": {
+                "av_key_present": bool(AV_KEY),
+                "note": "Likely API limit or Yahoo blocked"
+            }
+        }
 
     # 🔥 INDICATORS
     rsi = calculate_rsi(symbol)
     trend = get_trend(symbol)
 
     # 🔥 SIGNAL LOGIC
-    signal = "HOLD"
+    signal_value = "HOLD"
     confidence = 50
 
     if rsi:
         if rsi < 30 and trend == "UPTREND":
-            signal = "BUY"
+            signal_value = "BUY"
             confidence = 80
         elif rsi > 70 and trend == "DOWNTREND":
-            signal = "SELL"
+            signal_value = "SELL"
             confidence = 80
         elif rsi > 60:
-            signal = "SELL"
+            signal_value = "SELL"
             confidence = 65
         elif rsi < 40:
-            signal = "BUY"
+            signal_value = "BUY"
             confidence = 65
 
     response = {
@@ -226,12 +263,12 @@ async def signal(symbol: str):
         "price": round(price, 2),
         "rsi": round(rsi, 2) if rsi else None,
         "trend": trend,
-        "signal": signal,
+        "signal": signal_value,
         "confidence": confidence,
         "source": source
     }
 
-    # 🔥 CACHE IT
-    set_cache(symbol, response, ttl=60)
+    # 🔥 CACHE IT (IMPORTANT)
+    set_cache(cache_key, response, ttl=60)
 
     return response
