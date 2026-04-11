@@ -4,6 +4,9 @@ import requests
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 import os
 import yfinance as yf
+import redis
+import json
+import pandas as pd
 
 app = FastAPI()
 
@@ -14,13 +17,55 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-analyzer = SentimentIntensityAnalyzer()
+# --- ENV ---
 AV_KEY = os.getenv("AV_KEY")
+REDIS_URL = os.getenv("REDIS_URL")
 
+# --- INIT ---
+analyzer = SentimentIntensityAnalyzer()
+redis_client = redis.Redis.from_url(REDIS_URL) if REDIS_URL else None
+
+
+# -----------------------------
+# ROOT
+# -----------------------------
 @app.get("/")
 def root():
-    return {"status": "LIVE", "demo": "/stock-edge/AAPL"}
+    return {
+        "status": "LIVE",
+        "endpoints": {
+            "price": "/stock-edge/AAPL",
+            "signal": "/signal/AAPL"
+        }
+    }
 
+
+# -----------------------------
+# REDIS CACHE HELPERS
+# -----------------------------
+def get_cached(key):
+    if not redis_client:
+        return None
+    try:
+        data = redis_client.get(key)
+        if data:
+            return json.loads(data)
+    except:
+        return None
+
+
+def set_cache(key, data, ttl=60):
+    if not redis_client:
+        return
+    try:
+        redis_client.setex(key, ttl, json.dumps(data))
+    except:
+        pass
+
+
+# -----------------------------
+# PRICE FETCHERS
+# -----------------------------
 def get_price_av(symbol):
     if not AV_KEY:
         return None
@@ -29,25 +74,15 @@ def get_price_av(symbol):
         url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={symbol}&apikey={AV_KEY}"
         resp = requests.get(url, timeout=5).json()
 
-        print("FULL AV RESPONSE:", resp)  # 👈 VERY IMPORTANT
+        print("FULL AV RESPONSE:", resp)
 
-        # ❌ Handle rate limit / errors
         if "Note" in resp or "Error Message" in resp:
-            print("AV LIMIT OR ERROR")
             return None
 
         quote = resp.get("Global Quote", {})
-
-        # ❌ Handle empty quote
-        if not quote:
-            print("EMPTY QUOTE")
-            return None
-
         price_str = quote.get("05. price")
 
-        # ❌ Handle missing price
         if not price_str or price_str == "0.0000":
-            print("INVALID PRICE")
             return None
 
         return float(price_str)
@@ -66,20 +101,63 @@ def get_price_yf(symbol):
             return None
 
         return float(hist["Close"].iloc[-1])
+
     except Exception as e:
         print("YF ERROR:", e)
         return None
 
 
+# -----------------------------
+# INDICATORS
+# -----------------------------
+def calculate_rsi(symbol):
+    try:
+        ticker = yf.Ticker(symbol)
+        hist = ticker.history(period="14d")
+
+        if hist.empty:
+            return None
+
+        delta = hist["Close"].diff()
+        gain = delta.clip(lower=0).rolling(14).mean()
+        loss = -delta.clip(upper=0).rolling(14).mean()
+
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+
+        return float(rsi.iloc[-1])
+
+    except:
+        return None
+
+
+def get_trend(symbol):
+    try:
+        ticker = yf.Ticker(symbol)
+        hist = ticker.history(period="50d")
+
+        if hist.empty:
+            return "UNKNOWN"
+
+        ma20 = hist["Close"].rolling(20).mean().iloc[-1]
+        ma50 = hist["Close"].rolling(50).mean().iloc[-1]
+
+        return "UPTREND" if ma20 > ma50 else "DOWNTREND"
+
+    except:
+        return "UNKNOWN"
+
+
+# -----------------------------
+# PRICE ENDPOINT
+# -----------------------------
 @app.get("/stock-edge/{symbol}")
 async def edge(symbol: str):
     symbol = symbol.upper()
 
-    # 🔥 PRIMARY: Alpha Vantage
     price = get_price_av(symbol)
     source = "alpha_vantage"
 
-    # 🔁 FALLBACK: Yahoo
     if price is None:
         price = get_price_yf(symbol)
         source = "yfinance"
@@ -96,3 +174,64 @@ async def edge(symbol: str):
         "price": round(price, 2),
         "source": source
     }
+
+
+# -----------------------------
+# SIGNAL ENDPOINT (💰 MONEY MAKER)
+# -----------------------------
+@app.get("/signal/{symbol}")
+async def signal(symbol: str):
+    symbol = symbol.upper()
+
+    # 🔥 CACHE FIRST
+    cached = get_cached(symbol)
+    if cached:
+        return {**cached, "cached": True}
+
+    # 🔥 PRICE
+    price = get_price_av(symbol)
+    source = "alpha_vantage"
+
+    if price is None:
+        price = get_price_yf(symbol)
+        source = "yfinance"
+
+    if price is None:
+        return {"error": "No data", "symbol": symbol}
+
+    # 🔥 INDICATORS
+    rsi = calculate_rsi(symbol)
+    trend = get_trend(symbol)
+
+    # 🔥 SIGNAL LOGIC
+    signal = "HOLD"
+    confidence = 50
+
+    if rsi:
+        if rsi < 30 and trend == "UPTREND":
+            signal = "BUY"
+            confidence = 80
+        elif rsi > 70 and trend == "DOWNTREND":
+            signal = "SELL"
+            confidence = 80
+        elif rsi > 60:
+            signal = "SELL"
+            confidence = 65
+        elif rsi < 40:
+            signal = "BUY"
+            confidence = 65
+
+    response = {
+        "symbol": symbol,
+        "price": round(price, 2),
+        "rsi": round(rsi, 2) if rsi else None,
+        "trend": trend,
+        "signal": signal,
+        "confidence": confidence,
+        "source": source
+    }
+
+    # 🔥 CACHE IT
+    set_cache(symbol, response, ttl=60)
+
+    return response
