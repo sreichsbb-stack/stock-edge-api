@@ -195,24 +195,38 @@ def get_trend(symbol):
 # -----------------------------
 @app.get("/stock-edge/{symbol}")
 async def edge(symbol: str):
+    import time
+
     symbol = symbol.upper()
 
-    price = get_price_av(symbol)
-    source = "alpha_vantage"
+    price = None
+    source = None
 
-    if price is None:
-        time.sleep(1)
+    # 🔥 Try Alpha Vantage (2 attempts)
+    for attempt in range(2):
         price = get_price_av(symbol)
+        if price:
+            source = "alpha_vantage"
+            break
+        print(f"AV attempt {attempt + 1} failed")
+        time.sleep(1)
 
+    # 🔁 Fallback to Yahoo
     if price is None:
+        print("Falling back to Yahoo...")
         price = get_price_yf(symbol)
-        source = "yfinance"
+        if price:
+            source = "yfinance"
 
+    # ❌ Final failure
     if price is None:
         return {
             "error": "No data available",
             "symbol": symbol,
-            "av_key_present": bool(AV_KEY)
+            "debug": {
+                "av_key_present": bool(AV_KEY),
+                "note": "Alpha Vantage rate limit or Yahoo blocked"
+            }
         }
 
     return {
@@ -220,7 +234,6 @@ async def edge(symbol: str):
         "price": round(price, 2),
         "source": source
     }
-
 
 # -----------------------------
 # SIGNAL ENDPOINT
@@ -291,6 +304,6 @@ async def signal(symbol: str, api_key: str = None):
         "source": source
     }
 
-    set_cache(cache_key, response, ttl=60)
+    set_cache(cache_key, response, ttl=120)
 
     return response
