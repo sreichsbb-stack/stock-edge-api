@@ -1,11 +1,17 @@
 import asyncio
 import logging
+from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.core.auth import require_api_key
 from app.core.cache import cache
 from app.services.price_service import get_history, get_price
+from app.services.signal_logger import (
+    get_performance_stats,
+    log_signal,
+    resolve_outcomes,
+)
 from app.services.signal_service import compute_signal
 
 logger = logging.getLogger(__name__)
@@ -17,11 +23,8 @@ SIGNAL_TTL = 300  # 5 minutes
 @router.get("/signal/{symbol}", summary="Trading signal for a symbol")
 async def get_signal(symbol: str, _: str = Depends(require_api_key)):
     """
-    Returns BUY / SELL / HOLD signal with confidence score and full indicators.
-    Requires API key via `X-API-Key` header or `?api_key=` query param.
-
-    Degrades gracefully: if history is unavailable, returns price + INSUFFICIENT_DATA
-    rather than a hard 500.
+    Returns BUY / SELL / HOLD with confidence score and full indicators.
+    Requires API key via X-API-Key header or ?api_key= query param.
     """
     symbol = symbol.upper().strip()
     cache_key = f"signal:{symbol}"
@@ -30,19 +33,15 @@ async def get_signal(symbol: str, _: str = Depends(require_api_key)):
     if cached:
         return {**cached, "cached": True}
 
-    # Fetch price + history concurrently to minimise latency
     price_result, bars = await asyncio.gather(
         get_price(symbol),
         get_history(symbol, bars=60),
         return_exceptions=True,
     )
 
-    # Handle exceptions from gather
     if isinstance(price_result, Exception):
-        logger.error(f"price gather exception [{symbol}]: {price_result}")
         price_result = None
     if isinstance(bars, Exception):
-        logger.error(f"history gather exception [{symbol}]: {bars}")
         bars = []
 
     if price_result is None:
@@ -51,9 +50,7 @@ async def get_signal(symbol: str, _: str = Depends(require_api_key)):
             detail={"error": "All price providers failed", "symbol": symbol},
         )
 
-    # Graceful degradation: no history → return price without signal
     if not bars or len(bars) < 30:
-        logger.warning(f"Insufficient history for signal [{symbol}]: {len(bars) if bars else 0} bars")
         return {
             "symbol": symbol,
             "signal": "INSUFFICIENT_DATA",
@@ -62,7 +59,7 @@ async def get_signal(symbol: str, _: str = Depends(require_api_key)):
             "price": round(price_result.price, 2),
             "data_source": price_result.source,
             "cached": False,
-            "note": "Not enough historical data to compute signal. Try again shortly.",
+            "note": "Not enough historical data. Try again shortly.",
         }
 
     signal_result = compute_signal(bars, price_result.price, symbol)
@@ -84,6 +81,18 @@ async def get_signal(symbol: str, _: str = Depends(require_api_key)):
     }
 
     await cache.set(cache_key, response, ttl=SIGNAL_TTL)
+
+    # Log every fresh signal for performance tracking (fire and forget)
+    asyncio.create_task(
+        log_signal(
+            symbol=symbol,
+            signal=signal_result.signal,
+            confidence=signal_result.confidence,
+            price=price_result.price,
+            indicators=signal_result.indicators,
+        )
+    )
+
     return response
 
 
@@ -94,7 +103,9 @@ async def batch_signals(symbols: list[str], _: str = Depends(require_api_key)):
     Ideal for portfolio monitoring.
     """
     if len(symbols) > 10:
-        raise HTTPException(status_code=400, detail="Maximum 10 symbols per batch request")
+        raise HTTPException(
+            status_code=400, detail="Maximum 10 symbols per batch request"
+        )
 
     symbols = [s.upper().strip() for s in symbols]
 
@@ -115,7 +126,11 @@ async def batch_signals(symbols: list[str], _: str = Depends(require_api_key)):
         if isinstance(bars, Exception):
             bars = []
         if not bars or len(bars) < 30:
-            return {"symbol": sym, "signal": "INSUFFICIENT_DATA", "price": round(price_result.price, 2)}
+            return {
+                "symbol": sym,
+                "signal": "INSUFFICIENT_DATA",
+                "price": round(price_result.price, 2),
+            }
 
         result = compute_signal(bars, price_result.price, sym)
         if not result:
@@ -132,7 +147,39 @@ async def batch_signals(symbols: list[str], _: str = Depends(require_api_key)):
             "cached": False,
         }
         await cache.set(cache_key, response, ttl=SIGNAL_TTL)
+
+        asyncio.create_task(
+            log_signal(
+                symbol=sym,
+                signal=result.signal,
+                confidence=result.confidence,
+                price=price_result.price,
+                indicators=result.indicators,
+            )
+        )
+
         return response
 
     results = await asyncio.gather(*[_fetch_one(s) for s in symbols])
     return {"results": list(results), "count": len(results)}
+
+
+@router.get("/performance", summary="Signal accuracy stats (public)")
+async def performance_stats(symbol: Optional[str] = Query(default=None)):
+    """
+    Public endpoint showing tracked signal accuracy.
+    Use this on your RapidAPI listing and landing page.
+    Optional ?symbol=AAPL to filter by ticker.
+    """
+    stats = await get_performance_stats(symbol=symbol)
+    return stats
+
+
+@router.post("/performance/resolve", summary="Resolve pending signal outcomes")
+async def resolve(days: int = 1, _: str = Depends(require_api_key)):
+    """
+    Resolves unresolved signals older than `days` by checking current price.
+    Call this daily via a cron job or Render cron service.
+    """
+    resolved = await resolve_outcomes(lookback_days=days)
+    return {"resolved": resolved, "lookback_days": days}
