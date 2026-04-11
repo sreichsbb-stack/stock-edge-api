@@ -1,5 +1,4 @@
-from fastapi import FastAPI
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import requests
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
@@ -8,6 +7,7 @@ import yfinance as yf
 import redis
 import json
 import pandas as pd
+import time
 
 app = FastAPI()
 
@@ -21,10 +21,48 @@ app.add_middleware(
 # --- ENV ---
 AV_KEY = os.getenv("AV_KEY")
 REDIS_URL = os.getenv("REDIS_URL")
+API_KEYS = os.getenv("API_KEYS", "").split(",")
+RATE_LIMIT = int(os.getenv("RATE_LIMIT", "100"))
 
 # --- INIT ---
 analyzer = SentimentIntensityAnalyzer()
-redis_client = redis.Redis.from_url(REDIS_URL) if REDIS_URL else None
+
+# 🔥 SAFE REDIS INIT
+try:
+    if REDIS_URL and REDIS_URL.startswith(("redis://", "rediss://")):
+        redis_client = redis.Redis.from_url(REDIS_URL)
+    else:
+        print("⚠️ Redis disabled (invalid URL)")
+        redis_client = None
+except Exception as e:
+    print("⚠️ Redis init failed:", e)
+    redis_client = None
+
+
+# -----------------------------
+# AUTH + RATE LIMIT
+# -----------------------------
+def validate_api_key(api_key):
+    return api_key in API_KEYS
+
+
+def check_rate_limit(api_key):
+    if not redis_client:
+        return True
+
+    key = f"rate:{api_key}"
+    try:
+        count = redis_client.get(key)
+
+        if count and int(count) >= RATE_LIMIT:
+            return False
+
+        redis_client.incr(key)
+        redis_client.expire(key, 60)
+
+        return True
+    except:
+        return True
 
 
 # -----------------------------
@@ -36,13 +74,13 @@ def root():
         "status": "LIVE",
         "endpoints": {
             "price": "/stock-edge/AAPL",
-            "signal": "/signal/AAPL"
+            "signal": "/signal/AAPL?api_key=free123"
         }
     }
 
 
 # -----------------------------
-# REDIS CACHE HELPERS
+# REDIS CACHE
 # -----------------------------
 def get_cached(key):
     if not redis_client:
@@ -74,8 +112,6 @@ def get_price_av(symbol):
     try:
         url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={symbol}&apikey={AV_KEY}"
         resp = requests.get(url, timeout=5).json()
-
-        print("FULL AV RESPONSE:", resp)
 
         if "Note" in resp or "Error Message" in resp:
             return None
@@ -126,7 +162,12 @@ def calculate_rsi(symbol):
         rs = gain / loss
         rsi = 100 - (100 / (1 + rs))
 
-        return float(rsi.iloc[-1])
+        value = rsi.iloc[-1]
+
+        if pd.isna(value):
+            return None
+
+        return float(value)
 
     except:
         return None
@@ -154,20 +195,15 @@ def get_trend(symbol):
 # -----------------------------
 @app.get("/stock-edge/{symbol}")
 async def edge(symbol: str):
-    import time
-
     symbol = symbol.upper()
 
-    # 🔥 Try Alpha Vantage
     price = get_price_av(symbol)
     source = "alpha_vantage"
 
-    # 🔁 Retry once (handles AV hiccups)
     if price is None:
         time.sleep(1)
         price = get_price_av(symbol)
 
-    # 🔁 Fallback to Yahoo
     if price is None:
         price = get_price_yf(symbol)
         source = "yfinance"
@@ -187,91 +223,74 @@ async def edge(symbol: str):
 
 
 # -----------------------------
-# SIGNAL ENDPOINT (💰 MONEY MAKER)
+# SIGNAL ENDPOINT
 # -----------------------------
 @app.get("/signal/{symbol}")
 async def signal(symbol: str, api_key: str = None):
-    import time
-    from fastapi import HTTPException
 
-    try:
-        # 🔐 API KEY CHECK
-        if not api_key or not validate_api_key(api_key):
-            raise HTTPException(status_code=401, detail="Invalid API key")
+    # 🔐 AUTH
+    if not api_key or not validate_api_key(api_key):
+        raise HTTPException(status_code=401, detail="Invalid API key")
 
-        # 🚫 RATE LIMIT
-        if not check_rate_limit(api_key):
-            raise HTTPException(status_code=429, detail="Rate limit exceeded")
+    # 🚫 RATE LIMIT
+    if not check_rate_limit(api_key):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
 
-        symbol = symbol.upper()
-        cache_key = f"signal:{symbol}"
+    symbol = symbol.upper()
+    cache_key = f"signal:{symbol}"
 
-        # 🔥 CACHE
-        cached = get_cached(cache_key)
-        if cached:
-            return {**cached, "cached": True}
+    # 🔥 CACHE
+    cached = get_cached(cache_key)
+    if cached:
+        return {**cached, "cached": True}
 
-        # 🔥 PRICE
+    # 🔥 PRICE
+    price = get_price_av(symbol)
+    source = "alpha_vantage"
+
+    if price is None:
+        time.sleep(1)
         price = get_price_av(symbol)
-        source = "alpha_vantage"
 
-        if price is None:
-            time.sleep(1)
-            price = get_price_av(symbol)
+    if price is None:
+        price = get_price_yf(symbol)
+        source = "yfinance"
 
-        if price is None:
-            price = get_price_yf(symbol)
-            source = "yfinance"
+    if price is None:
+        return {"error": "No data", "symbol": symbol}
 
-        if price is None:
-            return {"error": "No data", "symbol": symbol}
+    # 🔥 INDICATORS
+    rsi = calculate_rsi(symbol)
+    trend = get_trend(symbol)
 
-        # 🔥 INDICATORS
-        rsi = calculate_rsi(symbol)
-        trend = get_trend(symbol)
+    # 🔥 SIGNAL LOGIC
+    signal_value = "HOLD"
+    confidence = 50
 
-        # SAFE RSI
-        if rsi is None or str(rsi) == "nan":
-            rsi = None
+    if rsi:
+        if rsi < 30 and trend == "UPTREND":
+            signal_value = "BUY"
+            confidence = 80
+        elif rsi > 70 and trend == "DOWNTREND":
+            signal_value = "SELL"
+            confidence = 80
+        elif rsi > 60:
+            signal_value = "SELL"
+            confidence = 65
+        elif rsi < 40:
+            signal_value = "BUY"
+            confidence = 65
 
-        # 🔥 SIGNAL LOGIC
-        signal_value = "HOLD"
-        confidence = 50
+    response = {
+        "symbol": symbol,
+        "price": round(price, 2),
+        "rsi": round(rsi, 2) if rsi else None,
+        "trend": trend,
+        "signal": signal_value,
+        "confidence": confidence,
+        "source": source
+    }
 
-        if rsi:
-            if rsi < 30 and trend == "UPTREND":
-                signal_value = "BUY"
-                confidence = 80
-            elif rsi > 70 and trend == "DOWNTREND":
-                signal_value = "SELL"
-                confidence = 80
-            elif rsi > 60:
-                signal_value = "SELL"
-                confidence = 65
-            elif rsi < 40:
-                signal_value = "BUY"
-                confidence = 65
+    set_cache(cache_key, response, ttl=60)
 
-        response = {
-            "symbol": symbol,
-            "price": round(price, 2),
-            "rsi": round(rsi, 2) if rsi else None,
-            "trend": trend,
-            "signal": signal_value,
-            "confidence": confidence,
-            "source": source
-        }
-
-        set_cache(cache_key, response, ttl=60)
-
-        return response
-
-    except HTTPException as e:
-        raise e
-
-    except Exception as e:
-        print("SIGNAL ERROR:", str(e))
-        return {
-            "error": "Internal error",
-            "details": str(e)
-        }
+    return response
