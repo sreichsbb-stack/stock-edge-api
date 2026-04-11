@@ -29,14 +29,25 @@ def get_price_av(symbol):
         url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={symbol}&apikey={AV_KEY}"
         resp = requests.get(url, timeout=5).json()
 
-        print("AV RESPONSE:", resp)  # DEBUG
+        print("FULL AV RESPONSE:", resp)  # 👈 VERY IMPORTANT
 
-        if "Global Quote" not in resp:
+        # ❌ Handle rate limit / errors
+        if "Note" in resp or "Error Message" in resp:
+            print("AV LIMIT OR ERROR")
             return None
 
-        price_str = resp["Global Quote"].get("05. price")
+        quote = resp.get("Global Quote", {})
 
-        if not price_str:
+        # ❌ Handle empty quote
+        if not quote:
+            print("EMPTY QUOTE")
+            return None
+
+        price_str = quote.get("05. price")
+
+        # ❌ Handle missing price
+        if not price_str or price_str == "0.0000":
+            print("INVALID PRICE")
             return None
 
         return float(price_str)
