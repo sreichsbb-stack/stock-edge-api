@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from fastapi import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import requests
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
